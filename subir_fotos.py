@@ -37,10 +37,15 @@ from PIL import Image, ImageOps
 # Pillow avisa de paletas con transparencia al pasar a gris: no es un fallo.
 warnings.filterwarnings("ignore", category=UserWarning, module="PIL")
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import portadas  # noqa: E402  (elige y compone la portada: camiseta completa de frente)
+
 # ----------------------------------------------------------------- config
 ORIGEN = r"C:\Users\diego\OneDrive\Escritorio\yupo\fotos"
 COPIA = r"C:\yupoo_fotos"
 ESTADO = os.path.join(COPIA, "_estado.json")
+PORTADAS = os.path.join(COPIA, "_portadas.json")   # decisiones del paso 2 (con visión)
+VERSION_PORTADA = 2                                # v2: camiseta completa de frente, lienzo 1000x1000
 TRABAJO = r"C:\yupoo_trabajo"
 REPO_DIR = os.path.join(TRABAJO, "US19-FOTOS")
 RAMA_FOTOS = "gh-pages"
@@ -52,12 +57,8 @@ PROP_ALBUM, PROP_FOTO, PROP_FOTO_URL = "Álbum ID", "Foto", "Foto URL"
 LOTE = 200                  # albumes por tanda (un commit por tanda)
 QUIETO_S = 120              # nada modificado en los ultimos 2 minutos
 ESPERA_TAMANO_S = 5         # segunda lectura del tamano
-LADO_MAX = 1000
-CALIDADES = (80, 74, 68, 62, 56, 50)
-OBJETIVO_BYTES = 300 * 1024
 TECHO_NOTION = 5 * 1024 * 1024
 INTENTOS_MAX = 3
-UMBRAL_GEMELA = 4           # bits distintos (de 64) para decir «es la misma foto»
 PAGES_ESPERA_MAX_S = 900    # lo que se espera a que GitHub Pages publique una tanda
 NOTION_INTERVALO_S = 0.35   # ~3 peticiones por segundo
 EXT_IMG = (".jpg", ".jpeg", ".png", ".webp", ".gif")
@@ -318,67 +319,18 @@ def leer_imagen(ruta):
         return im.size
 
 
-def dhash(ruta):
-    """Huella visual de 64 bits (no depende del tamaño) y lado mayor en px."""
-    with Image.open(ruta) as im:
-        lado = max(im.size)
-        g = im.convert("L").resize((9, 8), Image.LANCZOS)
-        px = list(g.get_flattened_data()) if hasattr(g, "get_flattened_data") else list(g.getdata())
-    bits = 0
-    for y in range(8):
-        for x in range(8):
-            bits = (bits << 1) | (px[y * 9 + x] > px[y * 9 + x + 1])
-    return bits, lado
-
-
-def elegir_portada(carpeta, imgs):
-    """La foto 1 (1.ª en orden alfabético) en su versión más grande del álbum.
-
-    Medido el 13-sep-2026 sobre 1.513 álbumes: cada foto viene dos veces, la
-    miniatura y la original, y en 1.173 álbumes el 1.jpg es la miniatura
-    (240-500 px) mientras su gemela mide 1080 px. Se busca la gemela por
-    huella visual: misma foto, otra resolución."""
-    primera = imgs[0]
-    h1, l1 = dhash(os.path.join(carpeta, primera))
-    mejor, mejor_l, mejor_d = primera, l1, 0
-    for f in imgs[1:]:
-        try:
-            h, l = dhash(os.path.join(carpeta, f))
-        except Exception:
-            continue
-        d = bin(h ^ h1).count("1")
-        if d <= UMBRAL_GEMELA and (l > mejor_l or (l == mejor_l and d < mejor_d)):
-            mejor, mejor_l, mejor_d = f, l, d
-    return primera, mejor, l1, mejor_l
-
-
-def optimizar(ruta_img, destino):
-    with Image.open(ruta_img) as im:
-        im.load()
-        im = ImageOps.exif_transpose(im)
-        tiene_alfa = im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info)
-        im = im.convert("RGBA" if tiene_alfa else "RGB")
-        im.thumbnail((LADO_MAX, LADO_MAX), Image.LANCZOS)
-        dims = im.size
-        for q in CALIDADES:
-            buf = io.BytesIO()
-            im.save(buf, "WEBP", quality=q, method=6)
-            if buf.tell() <= OBJETIVO_BYTES:
-                break
-    datos = buf.getvalue()
-    if len(datos) > TECHO_NOTION:
-        raise RuntimeError("el WebP pesa %d bytes, sobre el techo de 5 MiB" % len(datos))
+def escribir_si_cambia(destino, datos):
+    """Escribe el WebP solo si cambió: así una pasada repetida no genera commit."""
     os.makedirs(os.path.dirname(destino), exist_ok=True)
-    igual = False
     if os.path.exists(destino):
         with open(destino, "rb") as f:
-            igual = f.read() == datos
-    if not igual:
-        tmp = destino + ".tmp"
-        with open(tmp, "wb") as f:
-            f.write(datos)
-        os.replace(tmp, destino)
-    return dims, len(datos), q
+            if f.read() == datos:
+                return False
+    tmp = destino + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(datos)
+    os.replace(tmp, destino)
+    return True
 
 
 # ----------------------------------------------------------------- GitHub
@@ -496,23 +448,39 @@ def main():
         if est["albumes"].get(c, {}).get("estado") != "sin_fila":
             marcar(est, c, "sin_fila", "no hay fila en Notion con ese Álbum ID", guardar=False)
     guardar_estado(est)
-    candidatos, ya_hechos, en_error = [], 0, 0
+    decisiones = {}
+    if os.path.exists(PORTADAS):
+        with open(PORTADAS, encoding="utf-8") as f:
+            decisiones = json.load(f)
+    candidatos, ya_hechos, en_error, reparar = [], 0, 0, 0
     for c in carpetas:
         if c not in por_album:
             continue
-        falta = [f for f in por_album[c] if f["fotos"] == 0]
+        filas_c = por_album[c]
+        falta = [f for f in filas_c if f["fotos"] == 0]
         e = est["albumes"].get(c, {})
-        if not falta:                                  # Notion manda: ya tiene foto
-            if e.get("estado") != "hecho":
-                marcar(est, c, "hecho", "Notion ya tenía la foto")
+        # Revisada = portada v2 puesta. Notion manda: si todas sus filas ya apuntan a un
+        # «-v2.webp», se da por revisada aunque el estado local se haya perdido.
+        v2_en_notion = bool(filas_c) and all((f["foto_url"] or "").endswith("-v%d.webp" % VERSION_PORTADA)
+                                             for f in filas_c)
+        revisada = e.get("portada_version") == VERSION_PORTADA or v2_en_notion
+        if not falta and revisada:
+            if e.get("estado") not in ("hecho", "portada_dudosa"):
+                marcar(est, c, "hecho", "Notion ya tenía la portada v2", portada_version=VERSION_PORTADA, guardar=False)
             ya_hechos += 1
             continue
-        if e.get("estado") == "hecho":
-            log("   %s: el estado decía «hecho» pero en Notion falta la foto en %d fila(s): se rehace" % (c, len(falta)))
+        if e.get("estado") == "portada_dudosa" and revisada:
+            ya_hechos += 1                             # se dejó la foto actual a propósito
+            continue
         if e.get("estado") == "error":
             en_error += 1
             continue
+        if not falta:
+            reparar += 1                               # tiene Foto, pero de la selección vieja
         candidatos.append(c)
+    guardar_estado(est)
+    if reparar:
+        log("Filas con foto de la selección vieja (se revisan con la v2): %d álbum(es)" % reparar)
     if a.solo:
         pedidos = [x.strip() for x in a.solo.split(",") if x.strip()]
         candidatos = [c for c in pedidos if c in candidatos]
@@ -533,57 +501,87 @@ def main():
     log("Listas para procesar en esta pasada: %d" % len(listas))
 
     hechas, errores_pasada, tanda_n = [], [], 0
+    por_revisar, dudosas, solo_espalda, ya_correctas, reemplazadas = [], [], [], [], []
+    base_fotos = os.path.join(REPO_DIR if not a.seco else os.path.join(TRABAJO, "salida_seco"), "fotos")
     for i in range(0, len(listas), LOTE):
         tanda = listas[i:i + LOTE]
         tanda_n += 1
         log("--- Tanda %d: %d álbumes ---" % (tanda_n, len(tanda)))
-        preparados = []          # (aid, url, tamaño, paginas, portada, dims)
+        preparados = []          # dicts: aid, url, tam, paginas, archivo, tipo, caja, reemplaza
         for aid, r in tanda:
             try:
                 dst, imgs = copiar(aid, r)
-                try:
-                    leer_imagen(os.path.join(dst, imgs[0]))
-                    foto1, portada, l1, lp = elegir_portada(dst, imgs)
-                except Exception as e:
-                    marcar(est, aid, "pendiente", "portada %s ilegible todavía (%s)" % (imgs[0], e))
+                dec = decisiones.get(aid)
+                if not dec or dec.get("version") != VERSION_PORTADA:
+                    marcar(est, aid, "por_revisar", "falta elegir la portada: paso 2 (mirar la hoja de revisión)", guardar=False)
+                    por_revisar.append(aid)
                     continue
-                destino = os.path.join(REPO_DIR if not a.seco else os.path.join(TRABAJO, "salida_seco"),
-                                       "fotos", aid + ".webp")
-                dims, tam, q = optimizar(os.path.join(dst, portada), destino)
-                url = PAGES_BASE + "fotos/" + aid + ".webp"
-                paginas = [f["pagina"] for f in por_album[aid] if f["fotos"] == 0]
-                preparados.append((aid, url, tam, paginas, portada, dims))
-                version = "" if portada == foto1 else " (versión grande de %s: %d→%d px)" % (foto1, l1, lp)
-                log("   %s: portada %s%s → %dx%d, %d KB (q%d) · %d fila(s)"
-                    % (aid, portada, version, dims[0], dims[1], tam // 1024, q, len(paginas)))
+                tipo = dec.get("tipo", "frontal")
+                e = est["albumes"].get(aid, {})
+                if tipo == "dudosa":
+                    marcar(est, aid, "portada_dudosa", dec.get("motivo", ""), portada_version=VERSION_PORTADA)
+                    dudosas.append(aid)
+                    log("   %s: portada DUDOSA → se deja la foto actual (%s)" % (aid, dec.get("motivo", "")))
+                    continue
+                archivo = dec["archivo"]
+                ruta = os.path.join(dst, archivo)
+                leer_imagen(ruta)                                    # que exista y se abra de verdad
+                con_foto = [f for f in por_album[aid] if f["fotos"] > 0]
+                if con_foto and len(con_foto) == len(por_album[aid]) and archivo == e.get("portada"):
+                    marcar(est, aid, "hecho", "ya_correcta: la elegida es la que ya estaba", ya_correcta=True,
+                           portada_version=VERSION_PORTADA, tipo=tipo)
+                    ya_correctas.append(aid)
+                    log("   %s: ya_correcta (%s): no se toca la fila" % (aid, archivo))
+                    continue
+                caja, margen, nota = portadas.caja_final(ruta, dec.get("caja"))
+                datos, prenda, q = portadas.componer(ruta, caja, margen=margen)
+                if len(datos) > TECHO_NOTION:
+                    raise RuntimeError("el WebP pesa %d bytes, sobre el techo de 5 MiB" % len(datos))
+                nombre = "%s-v%d.webp" % (aid, VERSION_PORTADA)
+                escribir_si_cambia(os.path.join(base_fotos, nombre), datos)
+                preparados.append({"aid": aid, "url": PAGES_BASE + "fotos/" + nombre, "tam": len(datos),
+                                   "paginas": [f["pagina"] for f in por_album[aid]], "archivo": archivo,
+                                   "tipo": tipo, "caja": caja, "reemplaza": bool(con_foto)})
+                log("   %s: portada %s (%s) · %s · margen %d %% · prenda %dx%d en 1000x1000 · %d KB q%d · %d fila(s)%s"
+                    % (aid, archivo, tipo, nota, round(100 * margen), prenda[0], prenda[1], len(datos) // 1024, q,
+                       len(por_album[aid]), " · REEMPLAZA la foto actual" if con_foto else ""))
+                log("      por qué: %s" % dec.get("motivo", "(sin motivo anotado)"))
             except Exception as e:
                 ent = marcar(est, aid, "pendiente", "preparación: %s" % e, sumar_intento=True)
-                errores_pasada.append(aid) if ent["estado"] == "error" else None
+                if ent["estado"] == "error":
+                    errores_pasada.append(aid)
                 log("   %s: FALLO al preparar (%s) → %s" % (aid, e, ent["estado"]))
+        guardar_estado(est)
         if a.seco:
-            for aid, url, tam, paginas, portada, dims in preparados:
-                marcar(est, aid, "pendiente", "modo seco: preparada, sin publicar", portada=portada)
+            for p in preparados:
+                marcar(est, p["aid"], "pendiente", "modo seco: preparada, sin publicar", portada_prevista=p["archivo"])
             log("   (modo seco: no se publica ni se escribe en Notion)")
             continue
         if not preparados:
             continue
         try:
-            publicar(tanda_n, [p[0] for p in preparados], log)
+            publicar(tanda_n, [p["aid"] for p in preparados], log)
         except Exception as e:
             log("   GitHub: %s → la tanda queda pendiente" % e)
             for p in preparados:
-                marcar(est, p[0], "pendiente", "no se pudo publicar en GitHub: %s" % e)
+                marcar(est, p["aid"], "pendiente", "no se pudo publicar en GitHub: %s" % e)
             continue
-        vivas = esperar_pages({p[1]: p[2] for p in preparados}, log)
-        for aid, url, tam, paginas, portada, dims in preparados:
+        vivas = esperar_pages({p["url"]: p["tam"] for p in preparados}, log)
+        for p in preparados:
+            aid, url = p["aid"], p["url"]
             if url not in vivas:
                 marcar(est, aid, "pendiente", "GitHub Pages aún no sirve la portada", url=url)
                 continue
             try:
-                tocadas = subir_a_notion(notion, aid, url, paginas)
-                marcar(est, aid, "hecho", "", url=url, paginas=tocadas, portada=portada, dims=list(dims), bytes=tam)
+                tocadas = subir_a_notion(notion, aid, url, p["paginas"])   # Foto = [nueva]: reemplaza, no acumula
+                marcar(est, aid, "hecho", "", url=url, paginas=tocadas, portada=p["archivo"], tipo=p["tipo"],
+                       caja=p["caja"], bytes=p["tam"], portada_version=VERSION_PORTADA)
                 hechas.append(aid)
-                log("   %s: ✓ Notion · %s · páginas %s" % (aid, url, ", ".join(tocadas)))
+                if p["reemplaza"]:
+                    reemplazadas.append(aid)
+                if p["tipo"] == "solo_espalda":
+                    solo_espalda.append(aid)
+                log("   %s: ✓ Notion%s · %s · páginas %s" % (aid, " (reemplazada)" if p["reemplaza"] else "", url, ", ".join(tocadas)))
             except Exception as e:
                 ent = marcar(est, aid, "pendiente", "Notion: %s" % e, sumar_intento=True, url=url)
                 if ent["estado"] == "error":
@@ -609,6 +607,15 @@ def main():
     log("sin fila en Notion ...... %d" % cuenta.get("sin_fila", 0))
     log("errores (3 intentos) .... %d%s" % (cuenta.get("error", 0), (" · nuevos: " + ", ".join(errores_pasada)) if errores_pasada else ""))
     log("filas con foto .......... %d de %d" % (con_foto, total_filas))
+    log("portada v2 .............. %d puestas (%d reemplazan una vieja) · %d ya_correcta"
+        % (len(hechas), len(reemplazadas), len(ya_correctas)))
+    log("por revisar (paso 2) .... %d%s" % (cuenta.get("por_revisar", 0),
+        (" → hojas: python %s --por-revisar" % os.path.join(os.path.dirname(os.path.abspath(__file__)), "revisar_portadas.py"))
+        if cuenta.get("por_revisar") else ""))
+    todas_dudosas = sorted(k for k, v in est["albumes"].items() if v.get("estado") == "portada_dudosa")
+    log("portada_dudosa .......... %d%s" % (len(todas_dudosas), (": " + ", ".join(todas_dudosas)) if todas_dudosas else ""))
+    todas_espalda = sorted(k for k, v in est["albumes"].items() if v.get("tipo") == "solo_espalda")
+    log("solo_espalda ............ %d%s" % (len(todas_espalda), (": " + ", ".join(todas_espalda)) if todas_espalda else ""))
     if notion:
         log("peticiones a Notion ..... %d" % notion.peticiones)
     log("log: " + log.ruta)
